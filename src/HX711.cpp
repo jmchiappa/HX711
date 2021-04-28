@@ -10,6 +10,20 @@
 #include <Arduino.h>
 #include "HX711.h"
 
+HX711 *PrivateSelf;
+//#define DBG
+
+#ifdef DBG
+# define PrintPrefix(a) {Serial.print(a);Serial.print(":");}
+# define Print(a,b) 		{PrintPrefix(a);Serial.print(b);}
+# define Println(a,b) 		{PrintPrefix(a);Serial.println(b);}
+#else
+# define PrintPrefix(a) 
+# define Print(a,b) 		
+# define Println(a,b) 	
+#endif
+
+uint8_t led = D45;
 // TEENSYDUINO has a port of Dean Camera's ATOMIC_BLOCK macros for AVR to ARM Cortex M3.
 #define HAS_ATOMIC_BLOCK (defined(ARDUINO_ARCH_AVR) || defined(TEENSYDUINO))
 
@@ -51,6 +65,7 @@ uint8_t shiftInSlow(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder) {
             value |= digitalRead(dataPin) << i;
         else
             value |= digitalRead(dataPin) << (7 - i);
+
         digitalWrite(clockPin, LOW);
         delayMicroseconds(1);
     }
@@ -76,11 +91,17 @@ void HX711::begin(byte dout, byte pd_sck, byte gain) {
 	pinMode(DOUT, INPUT_PULLUP);
 
 	set_gain(gain);
+	power_down();
+	attachInterrupt(DOUT,HX711::read,FALLING);
+	Println("begin: OUT",DOUT);
+	#ifdef DBG
+		pinMode(led,OUTPUT);
+	#endif
 }
 
-bool HX711::is_ready() {
-	return digitalRead(DOUT) == LOW;
-}
+// bool HX711::is_ready() {
+// 	return digitalRead(DOUT) == LOW;
+// }
 
 void HX711::set_gain(byte gain) {
 	switch (gain) {
@@ -97,15 +118,20 @@ void HX711::set_gain(byte gain) {
 
 }
 
-long HX711::read() {
+void HX711::read(void) {
+	// digitalWrite(led,HIGH);
+	// Serial.println("get sample");
+	// release attached interrupt if any
+	detachInterrupt(PrivateSelf->DOUT);
 
 	// Wait for the chip to become ready.
-	wait_ready();
+	// wait_ready();
 
 	// Define structures for reading data into.
 	unsigned long value = 0;
 	uint8_t data[3] = { 0 };
 	uint8_t filler = 0x00;
+
 
 	// Protect the read sequence from system interrupts.  If an interrupt occurs during
 	// the time the PD_SCK signal is high it will stretch the length of the clock pulse.
@@ -138,18 +164,19 @@ long HX711::read() {
 	#endif
 
 	// Pulse the clock pin 24 times to read the data.
-	data[2] = SHIFTIN_WITH_SPEED_SUPPORT(DOUT, PD_SCK, MSBFIRST);
-	data[1] = SHIFTIN_WITH_SPEED_SUPPORT(DOUT, PD_SCK, MSBFIRST);
-	data[0] = SHIFTIN_WITH_SPEED_SUPPORT(DOUT, PD_SCK, MSBFIRST);
+	data[2] = SHIFTIN_WITH_SPEED_SUPPORT(PrivateSelf->DOUT, PrivateSelf->PD_SCK, MSBFIRST);
+	data[1] = SHIFTIN_WITH_SPEED_SUPPORT(PrivateSelf->DOUT, PrivateSelf->PD_SCK, MSBFIRST);
+	data[0] = SHIFTIN_WITH_SPEED_SUPPORT(PrivateSelf->DOUT, PrivateSelf->PD_SCK, MSBFIRST);
+	// digitalToggle(led);
 
 	// Set the channel and the gain factor for the next reading using the clock pin.
-	for (unsigned int i = 0; i < GAIN; i++) {
-		digitalWrite(PD_SCK, HIGH);
-		#if ARCH_ESPRESSIF
+	for (unsigned int i = 0; i < PrivateSelf->GAIN; i++) {
+		digitalWrite(PrivateSelf->PD_SCK, HIGH);
+		#if FAST_CPU
 		delayMicroseconds(1);
 		#endif
-		digitalWrite(PD_SCK, LOW);
-		#if ARCH_ESPRESSIF
+		digitalWrite(PrivateSelf->PD_SCK, LOW);
+		#if FAST_CPU
 		delayMicroseconds(1);
 		#endif
 	}
@@ -164,6 +191,9 @@ long HX711::read() {
 	#else
 	// Enable interrupts again.
 	interrupts();
+	// attach the ready interrupt
+	// Serial.println("end of ack");
+	attachInterrupt(PrivateSelf->DOUT,HX711::read, FALLING);
 	#endif
 
 	// Replicate the most significant bit to pad out a 32-bit signed integer
@@ -179,9 +209,36 @@ long HX711::read() {
 			| static_cast<unsigned long>(data[1]) << 8
 			| static_cast<unsigned long>(data[0]) );
 
-	return static_cast<long>(value);
+	PrivateSelf->sum += value;
+	Println("nb samples",PrivateSelf->nbSamples);
+	if((--PrivateSelf->nbSamples)==0) {
+		PrivateSelf->power_down();
+		switch(PrivateSelf->mode) {
+			case GET_AVERAGE:
+				PrivateSelf->result = PrivateSelf->sum/PrivateSelf->nbInitialSamples;
+				break;
+			case GET_VALUE:
+				PrivateSelf->result= PrivateSelf->sum/PrivateSelf->nbInitialSamples - PrivateSelf->OFFSET;
+				break;
+			case GET_UNITS:
+				PrivateSelf->result = (PrivateSelf->sum/PrivateSelf->nbInitialSamples - PrivateSelf->OFFSET) / PrivateSelf->SCALE;
+				break;
+		}
+		PrivateSelf->DataReady  = true;
+		// Serial.println("done");
+		if(PrivateSelf->callback_!=NULL) PrivateSelf->callback_(PrivateSelf->result);
+	}
 }
-
+// void (*callback)(void)
+// void HX711::onceReady() {
+// 	if(is_ready()) {
+// 		read();
+// 	}
+// 	else {
+// 		attachInterrupt(DOUT,read,FALLING);
+// 	}
+// }
+/*
 void HX711::wait_ready(unsigned long delay_ms) {
 	// Wait for the chip to become ready.
 	// This is a blocking implementation and will
@@ -220,29 +277,61 @@ bool HX711::wait_ready_timeout(unsigned long timeout, unsigned long delay_ms) {
 	}
 	return false;
 }
+*/
 
-long HX711::read_average(byte times) {
-	long sum = 0;
-	for (byte i = 0; i < times; i++) {
-		sum += read();
-		// Probably will do no harm on AVR but will feed the Watchdog Timer (WDT) on ESP.
-		// https://github.com/bogde/HX711/issues/73
-		delay(0);
-	}
-	return sum / times;
+boolean HX711::isDataReady(void) {
+	return DataReady;
 }
 
-double HX711::get_value(byte times) {
-	return read_average(times) - OFFSET;
+float HX711::ReadValue(void) {
+	DataReady=false;
+	return result;
 }
 
-float HX711::get_units(byte times) {
-	return get_value(times) / SCALE;
+void HX711::read_average(void (*onCompleteCallback)(float) ,byte times) {
+	PrivateSelf = static_cast<HX711 *>(this);;
+	callback_ = onCompleteCallback;
+	nbSamples = times;
+	mode = GET_AVERAGE;
+	sum = 0;
+	DataReady = false;
+	power_up();
+
+}
+
+void HX711::get_value(void (*onCompleteCallback)(float) ,byte times) {
+	PrivateSelf = static_cast<HX711 *>(this);;
+	callback_ = onCompleteCallback;
+	nbSamples = times;
+	sum = 0;
+	nbInitialSamples = nbSamples;
+	mode = GET_VALUE;
+	DataReady = false;
+	power_up();
+}
+
+void HX711::get_units(void (*onCompleteCallback)(float) ,byte times) {
+	PrivateSelf = static_cast<HX711 *>(this);;
+	callback_ = onCompleteCallback;
+	nbSamples = times;
+	sum = 0;
+	nbInitialSamples = nbSamples;
+	mode = GET_UNITS;
+	DataReady = false;
+	power_up();
 }
 
 void HX711::tare(byte times) {
-	double sum = read_average(times);
-	set_offset(sum);
+	PrivateSelf = static_cast<HX711 *>(this);;
+	callback_ = NULL;
+	mode = GET_AVERAGE;
+	nbSamples = times;
+	nbInitialSamples = nbSamples;
+	power_up();
+	Println("tare","démarrage");
+	while(!isDataReady()) {delay(10);}
+	Println("tare résultat",result);
+	set_offset(ReadValue());
 }
 
 void HX711::set_scale(float scale) {
